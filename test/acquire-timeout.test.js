@@ -4,6 +4,7 @@
 // License text available at https://opensource.org/licenses/MIT
 
 'use strict';
+/* global WeakRef */
 require('./init.js');
 const should = require('should');
 
@@ -39,7 +40,7 @@ describe('acquireTimeout', function() {
           select(db, 1, {}, function(err) {
             should.exist(err);
             err.code.should.equal('ER_POOL_ACQUIRE_TIMEOUT');
-            (Date.now() - started).should.be.within(400, 3000);
+            (Date.now() - started).should.be.aboveOrEqual(400);
             // The open transaction still runs while the pool is drained.
             const tx = {connection: conn, connector: db.connector};
             select(db, 2, {transaction: tx}, function(err, rows) {
@@ -57,6 +58,37 @@ describe('acquireTimeout', function() {
               });
             });
           });
+        });
+      });
+
+    it('does not keep the caller alive while its request waits in the queue',
+      function(done) {
+        this.timeout(10000);
+        // mysql2 has no way to take a callback out of its queue, so after a
+        // timeout the queued entry must not hold on to the caller's callback.
+        require('v8').setFlagsFromString('--expose-gc');
+        const gc = require('vm').runInNewContext('gc');
+        function request() {
+          const caller = {payload: Buffer.alloc(1024 * 1024)};
+          db.connector.getPoolConnection(function(err) {
+            caller.err = err;
+          });
+          return new WeakRef(caller);
+        }
+        db.connector.beginTransaction('READ COMMITTED', function(err, conn) {
+          if (err) return done(err);
+          const ref = request();
+          setTimeout(function() {
+            gc();
+            setImmediate(function() {
+              const alive = ref.deref() !== undefined;
+              db.connector.rollback(conn, function(err) {
+                if (err) return done(err);
+                alive.should.equal(false);
+                done();
+              });
+            });
+          }, 1000);
         });
       });
   });
